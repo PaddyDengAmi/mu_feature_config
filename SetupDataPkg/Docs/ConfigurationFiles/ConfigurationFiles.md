@@ -229,3 +229,65 @@ Where GUID is the namespace GUID, Name is the knob name, Value is the data assoc
 is a general description of the knob. Help is optional. The GUID is only printed once, to save space, and all other
 knobs sharing the same GUID simply print `*` in the GUID field, indicating they use whichever GUID is printed above the
 line of `*`s.
+
+## Command Line: Crafting and Dumping a .vl File
+
+[ModifyConfVarList.py](../../Tools/ModifyConfVarList.py) works with .vl data from a config XML without the UI. It has
+two subcommands: `modify` creates or updates a .vl file, and `dump` prints the fields of the schema with their values.
+
+A field is a knob (`INTEGER_KNOB`), a struct member (`KNOB.member`), or an array element (`KNOB.member[2]`,
+`KNOB.children[1].data[0]`).
+
+### modify
+
+Changes specific fields. Values use the same syntax as the defaults in the XML (numbers, enum names, `true`/`false`,
+`{...}` for structs and arrays). If a knob name exists in more than one namespace, prefix the field with the namespace
+GUID (`GUID:KNOB.member=VALUE`).
+
+```text
+# Default .vl built from the schema alone
+python ModifyConfVarList.py modify -x sampleschema.xml -o out.vl
+
+# Change fields; run again with -i to add more changes to the same file (-i and -o may be the same file)
+python ModifyConfVarList.py modify -x sampleschema.xml -i out.vl -o out.vl -s COMPLEX_KNOB1a.mode=SECOND -s INTEGER_KNOB=0x20
+
+# Only output the variables changed by this run
+python ModifyConfVarList.py modify -x sampleschema.xml -i out.vl -o delta.vl -s INTEGER_KNOB=5 --drop-unrelated
+```
+
+- Without `-i`, the defaults of the schema are used as the starting point. With `-i`, variables that are not changed
+  (including ones not in the schema) are kept as they are, unless `--drop-unrelated` is given.
+- `--from-system` starts from the variables of the running system instead of `-i`, and `--apply` writes the result to
+  the system. They use `ReadUefiVarsToConfVarList` and `WriteConfVarListToUefiVars`, which are located automatically:
+  a compiled `.exe` next to the script or in `PATH` is preferred, then the `.py` in the same folder. Use `--read-tool`
+  and `--write-tool` to select a specific one. These options need Administrator/root privilege.
+
+### dump
+
+Prints one line per field with its type, value, schema default and state. The values come from the schema defaults
+(no source), from a .vl file (`-i`), from the running system (`--from-system`, same tool lookup and privilege as
+above), or from the current configuration (`--current`). The state is `default`, `modified` (differs from the schema
+default), or `not-set` (a source was given but it does not contain that variable, so the default is shown).
+
+`--current` reads the system variables and uses the schema default for every variable that is not there. Unlike
+`--from-system`, it does not fail when the system cannot be read (no privilege, no UEFI variable support, tool not
+found): it prints a warning and shows the schema defaults, all as `not-set`.
+
+The result is printed to stdout. `-o` is optional and writes it to a file instead.
+
+```text
+# Schema defaults, every field
+python ModifyConfVarList.py dump -x sampleschema.xml
+
+# Values from a .vl file, only the fields that differ from the defaults
+python ModifyConfVarList.py dump -x sampleschema.xml -i out.vl --changed-only
+
+# Current configuration of this system, system values with schema defaults for what is missing
+python ModifyConfVarList.py dump -x sampleschema.xml --current
+
+# Values of this system, filtered by wildcard, one line per knob, as CSV
+python ModifyConfVarList.py dump -x sampleschema.xml --from-system -f "COMPLEX_KNOB1a*" --knobs --format csv
+```
+
+- `-f/--filter` can be repeated and is case insensitive. It matches the field name or `NAMESPACE_GUID:FIELD`.
+- `--format` is `text` (default), `csv` or `json`.
