@@ -258,16 +258,20 @@ python ModifyConfVarList.py modify -x sampleschema.xml -i out.vl -o delta.vl -s 
 - Without `-i`, the defaults of the schema are used as the starting point. With `-i`, variables that are not changed
   (including ones not in the schema) are kept as they are, unless `--drop-unrelated` is given.
 - `--from-system` starts from the variables of the running system instead of `-i`, and `--apply` writes the result to
-  the system. They use `ReadUefiVarsToConfVarList` and `WriteConfVarListToUefiVars`, which are located automatically:
-  a compiled `.exe` next to the script or in `PATH` is preferred, then the `.py` in the same folder. Use `--read-tool`
-  and `--write-tool` to select a specific one. These options need Administrator/root privilege.
+  the system. They use `ReadUefiVarsToConfVarList` and `WriteConfVarListToUefiVars`, which are located automatically,
+  in this order: `--read-tool`/`--write-tool` if given, a compiled `.exe` in the current directory
+  (`./ReadUefiVarsToConfVarList.exe`), a compiled `.exe` next to the script, a compiled `.exe` in `PATH`, then the `.py`
+  in the script folder. These options need Administrator/root privilege.
+- If the system has none of the variables of the schema, `--from-system` does not fail: the schema defaults are used
+  (a warning is printed). Other read failures, such as a missing privilege, are still reported as errors.
 
 ### dump
 
 Prints one line per field with its type, value, schema default and state. The values come from the schema defaults
 (no source), from a .vl file (`-i`), from the running system (`--from-system`, same tool lookup and privilege as
 above), or from the current configuration (`--current`). The state is `default`, `modified` (differs from the schema
-default), or `not-set` (a source was given but it does not contain that variable, so the default is shown).
+default), or `not-set` (a source was given but it does not contain that variable, so the default is shown). With
+`--from-system` on a system that has none of the variables, every field is shown with its schema default as `not-set`.
 
 `--current` reads the system variables and uses the schema default for every variable that is not there. Unlike
 `--from-system`, it does not fail when the system cannot be read (no privilege, no UEFI variable support, tool not

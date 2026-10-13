@@ -36,8 +36,9 @@ WRITE_TOOL_NAME = "WriteConfVarListToUefiVars"
 # Attributes used when a variable has to be created: NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
 DEFAULT_ATTRIBUTES = 7
 
-# Exit code reported by ReadUefiVarsToConfVarList when it did not find any variable (-1)
-READ_TOOL_NO_VARIABLES_CODES = (-1, 255)
+# Exit code reported by ReadUefiVarsToConfVarList when it did not find any variable: it exits with -1, which is
+# reported as 255 on Linux and as 0xFFFFFFFF on Windows
+READ_TOOL_NO_VARIABLES_CODES = (-1, 255, 0xFFFFFFFF)
 
 
 class ModifyError(Exception):
@@ -284,8 +285,8 @@ def write_file_atomic(path, data):
 def find_tool(base_name, override=None):
     """Find a command to run a tool. Returns the command as a list.
 
-    Order: explicit override, compiled executable next to this script, compiled executable
-    in PATH, then the python script next to this script.
+    Order: explicit override, compiled executable in the current directory (./<name>.exe), compiled executable
+    next to this script, compiled executable in PATH, then the python script next to this script.
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -300,9 +301,10 @@ def find_tool(base_name, override=None):
         return as_command(override)
 
     exe_name = base_name + (".exe" if os.name == "nt" else "")
-    local_exe = os.path.join(script_dir, exe_name)
-    if os.path.isfile(local_exe):
-        return [local_exe]
+    for directory in (os.getcwd(), script_dir):
+        exe = os.path.join(directory, exe_name)
+        if os.path.isfile(exe):
+            return [exe]
 
     path_exe = shutil.which(exe_name)
     if path_exe:
@@ -337,7 +339,7 @@ def read_system_variables(arguments, schema_path):
     try:
         rc = run_tool(tool + ["-x", schema_path, "-o", temp_path] + hash_check_args(arguments))
         if rc in READ_TOOL_NO_VARIABLES_CODES:
-            logging.warning("The system has no variables for this schema")
+            logging.warning("The system has no variables for this schema, using the schema defaults")
             return []
         if rc != 0:
             raise ModifyError(f"{READ_TOOL_NAME} failed with exit code {rc}")
@@ -360,7 +362,8 @@ def add_common_arguments(parser):
     parser.add_argument("-x", "--xml", dest="schema_file", required=True, type=str,
                         help="Config schema XML file")
     parser.add_argument("--read-tool", type=str,
-                        help=f"Path of {READ_TOOL_NAME} (.exe or .py), detected automatically by default")
+                        help=f"Path of {READ_TOOL_NAME} (.exe or .py). Default: ./{READ_TOOL_NAME}.exe, "
+                             "else the one next to this script or in PATH, else the .py next to this script")
     parser.add_argument("--skip-fw-xml-hash-check", action="store_true",
                         help="Passed to the Read/Write tools: skip validating the XML hash against system FW")
     parser.add_argument("--ignore-fw-xml-hash-mismatch", action="store_true",
@@ -412,7 +415,8 @@ Examples:
     modify.add_argument("--apply", action="store_true",
                         help=f"Write the output .vl to the variables of this system with {WRITE_TOOL_NAME}")
     modify.add_argument("--write-tool", type=str,
-                        help=f"Path of {WRITE_TOOL_NAME} (.exe or .py), detected automatically by default")
+                        help=f"Path of {WRITE_TOOL_NAME} (.exe or .py). Default: ./{WRITE_TOOL_NAME}.exe, "
+                             "else the one next to this script or in PATH, else the .py next to this script")
 
     dump = subparsers.add_parser(
         "dump", help="Print the fields of the schema with their values",

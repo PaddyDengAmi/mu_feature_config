@@ -286,12 +286,17 @@ class ToolIntegrationTests(QuietTestCase):
         self.exe_name = mcv.READ_TOOL_NAME + (".exe" if os.name == "nt" else "")
 
     def fake_script_dir(self, *file_names):
-        """Make find_tool search a temporary folder instead of the folder of the real tools."""
+        """Make find_tool search temporary folders instead of the folders of the real tools."""
+        self.script_dir = os.path.join(self.tmp.name, "script")
+        self.cwd_dir = os.path.join(self.tmp.name, "cwd")
+        os.makedirs(self.script_dir, exist_ok=True)
+        os.makedirs(self.cwd_dir, exist_ok=True)
         for name in file_names:
-            open(os.path.join(self.tmp.name, name), "w").close()
-        patcher = mock.patch.object(mcv, "__file__", os.path.join(self.tmp.name, "ModifyConfVarList.py"))
-        patcher.start()
-        self.addCleanup(patcher.stop)
+            open(os.path.join(self.script_dir, name), "w").close()
+        for patcher in (mock.patch.object(mcv, "__file__", os.path.join(self.script_dir, "ModifyConfVarList.py")),
+                        mock.patch("os.getcwd", return_value=self.cwd_dir)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_find_tool_override(self):
         py_tool = os.path.join(self.tmp.name, "tool.py")
@@ -303,10 +308,21 @@ class ToolIntegrationTests(QuietTestCase):
         with self.assertRaises(mcv.ModifyError):
             mcv.find_tool("x", os.path.join(self.tmp.name, "missing.exe"))
 
+    def test_find_tool_defaults_to_executable_in_current_directory(self):
+        self.fake_script_dir(self.exe_name, mcv.READ_TOOL_NAME + ".py")
+        cwd_exe = os.path.join(self.cwd_dir, self.exe_name)
+        open(cwd_exe, "w").close()
+        with mock.patch("shutil.which", return_value="C:/bin/" + self.exe_name):
+            self.assertEqual(mcv.find_tool(mcv.READ_TOOL_NAME), [cwd_exe])
+        # An explicit tool still wins
+        override = os.path.join(self.tmp.name, "mine.exe")
+        open(override, "w").close()
+        self.assertEqual(mcv.find_tool(mcv.READ_TOOL_NAME, override), [override])
+
     def test_find_tool_prefers_executable_next_to_script(self):
         self.fake_script_dir(self.exe_name, mcv.READ_TOOL_NAME + ".py")
         with mock.patch("shutil.which", return_value="C:/bin/" + self.exe_name):
-            self.assertEqual(mcv.find_tool(mcv.READ_TOOL_NAME), [os.path.join(self.tmp.name, self.exe_name)])
+            self.assertEqual(mcv.find_tool(mcv.READ_TOOL_NAME), [os.path.join(self.script_dir, self.exe_name)])
 
     def test_find_tool_prefers_executable_in_path_over_script(self):
         self.fake_script_dir(mcv.READ_TOOL_NAME + ".py")
@@ -314,8 +330,8 @@ class ToolIntegrationTests(QuietTestCase):
             self.assertEqual(mcv.find_tool(mcv.READ_TOOL_NAME), ["C:/bin/" + self.exe_name])
 
     def test_find_tool_falls_back_to_script(self):
-        script = os.path.join(self.tmp.name, mcv.READ_TOOL_NAME + ".py")
         self.fake_script_dir(mcv.READ_TOOL_NAME + ".py")
+        script = os.path.join(self.script_dir, mcv.READ_TOOL_NAME + ".py")
         with mock.patch("shutil.which", return_value=None):
             self.assertEqual(mcv.find_tool(mcv.READ_TOOL_NAME), [sys.executable, script])
 
@@ -330,6 +346,62 @@ class ToolIntegrationTests(QuietTestCase):
         for name in (mcv.READ_TOOL_NAME, mcv.WRITE_TOOL_NAME):
             command = mcv.find_tool(name)
             self.assertTrue(os.path.isfile(command[-1]), command)
+
+    def fake_read_tool(self, exit_code, vl_data=b""):
+        """A real executable (python script) that behaves like ReadUefiVarsToConfVarList, run for real."""
+        script = os.path.join(self.tmp.name, "FakeRead.py")
+        data_path = os.path.join(self.tmp.name, "fake_data.vl")
+        with open(data_path, "wb") as f:
+            f.write(vl_data)
+        with open(script, "w") as f:
+            f.write("import sys, shutil\n"
+                    "out = sys.argv[sys.argv.index('-o') + 1]\n"
+                    f"shutil.copyfile({data_path!r}, out)\n"
+                    f"sys.exit({exit_code})\n")
+        return script
+
+    def test_from_system_without_variables_uses_schema_defaults(self):
+        # The real read tool exits with -1 when it finds no variable, which is a large number on Windows
+        tool = self.fake_read_tool(-1)
+        out = os.path.join(self.tmp.name, "out.vl")
+
+        self.assertEqual(mcv.main(["modify", "-x", sample_path(), "-o", out, "--from-system", "--read-tool", tool,
+                                   "-s", "INTEGER_KNOB=7"]), 0)
+        variables = as_dict(read_vlist(out))
+        schema = Schema.load(sample_path())
+        self.assertEqual(len(variables), len(schema.knobs))
+        knob = schema.get_knob(uuid.UUID(NS1), "INTEGER_KNOB").knob
+        self.assertEqual(knob.format.binary_to_object(variables[(NS1, "INTEGER_KNOB")].data), 7)
+        other = schema.get_knob(uuid.UUID(NS2), "INTEGER_KNOB2").knob
+        self.assertEqual(other.format.binary_to_object(variables[(NS2, "INTEGER_KNOB2")].data), 89)
+
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(mcv.main(["dump", "-x", sample_path(), "--from-system", "--read-tool", tool,
+                                       "-f", "INTEGER_KNOB", "--format", "csv"]), 0)
+        self.assertEqual(printed.call_args.args[0].splitlines()[1], f"{NS1},INTEGER_KNOB,uint32_t,100,100,not-set")
+
+    def test_from_system_exit_codes(self):
+        for code in (-1, 255):
+            self.assertIn(mcv.run_tool([sys.executable, self.fake_read_tool(code), "-o", self.fake_vl_path()]),
+                          mcv.READ_TOOL_NO_VARIABLES_CODES)
+        # Other failures are still reported
+        out = os.path.join(self.tmp.name, "out.vl")
+        tool = self.fake_read_tool(1)
+        self.assertEqual(mcv.main(["modify", "-x", sample_path(), "-o", out, "--from-system", "--read-tool", tool]), 1)
+        self.assertFalse(os.path.exists(out))
+
+    def fake_vl_path(self):
+        return os.path.join(self.tmp.name, "scratch.vl")
+
+    def test_from_system_with_variables_uses_them(self):
+        schema = Schema.load(sample_path())
+        knob = schema.get_knob(uuid.UUID(NS1), "INTEGER_KNOB").knob
+        data = create_vlist_buffer(UEFIVariable("INTEGER_KNOB", uuid.UUID(NS1), knob.format.object_to_binary(55)))
+        tool = self.fake_read_tool(0, data)
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(mcv.main(["dump", "-x", sample_path(), "--from-system", "--read-tool", tool,
+                                       "-f", "INTEGER_KNOB", "--format", "csv"]), 0)
+        self.assertEqual(printed.call_args.args[0].splitlines()[1], f"{NS1},INTEGER_KNOB,uint32_t,55,100,modified")
 
     def test_from_system_and_apply(self):
         out = os.path.join(self.tmp.name, "out.vl")
