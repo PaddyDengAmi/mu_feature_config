@@ -21,7 +21,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ModifyConfVarList as mcv                                     # noqa: E402
-from VariableList import Schema, UEFIVariable, read_vlist, create_vlist_buffer      # noqa: E402
+from VariableList import Schema, UEFIVariable, ParseError, read_vlist, create_vlist_buffer      # noqa: E402
 
 NS1 = "FE3ED49F-B173-41ED-9076-356661D46A42"
 NS2 = "8CF777E5-0D01-479D-9255-19B1F07328D4"
@@ -276,6 +276,237 @@ class ModifyConfVarListTests(QuietTestCase):
             self.assertEqual(mcv.main(["dump", "-x", sample_path(), "--filter", "INTEGER_KNOB"]), 0)
         self.assertEqual(len(printed.call_args_list), 1)
         self.assertIn("INTEGER_KNOB", printed.call_args.args[0])
+
+    RANGE_SCHEMA = """<ConfigSchema>
+  <Enums>
+    <Enum name="MODE_T" help="Modes">
+      <Value name="A" prettyname="Mode A" value="0" help="First one" />
+      <Value name="B" value="5" />
+    </Enum>
+  </Enums>
+  <Structs>
+    <Struct name="s_t">
+      <Member name="level" type="uint8_t" default="125" min="100" max="150" help="Level help" />
+      <Member name="mode" type="MODE_T" />
+      <Member name="vals" type="uint16_t" count="3" default="{1}" />
+    </Struct>
+  </Structs>
+  <Knobs namespace="{11111111-2222-3333-4444-555555555555}">
+    <Knob name="TDP" type="uint8_t" default="125" min="100" max="150" help="TDP help" />
+    <Knob name="RATIO" type="float" default="1.5" min="0.5" max="2.5" />
+    <Knob name="SWITCH" type="bool" default="false" />
+    <Knob name="S" type="s_t" help="Struct help" />
+  </Knobs>
+</ConfigSchema>"""
+
+    def describe_by_field(self, schema, **kwargs):
+        return {r["Field"]: r for r in mcv.describe_rows(schema, **kwargs)}
+
+    def test_describe_enum_bool_and_numbers(self):
+        rows = self.describe_by_field(self.schema)
+        mode = rows["COMPLEX_KNOB1a.mode"]
+        self.assertEqual((mode["Type"], mode["Kind"], mode["Default"]), ("OPTION_MODE", "enum", "First Mode"))
+        self.assertEqual([(v["name"], v["pretty_name"], v["value"], v["help"]) for v in mode["Values"]],
+                         [("FIRST", "First Mode", 0, "First mode"), ("SECOND", "Second Mode", 1, "Second mode"),
+                          ("THIRD", "Third Mode", 2, "Third mode")])
+        self.assertIn("FIRST=0 (First Mode)", mode["Valid"])
+
+        self.assertEqual(rows["BOOLEAN_KNOB"]["Valid"], "true or false")
+        self.assertEqual(rows["BOOLEAN_KNOB"]["Kind"], "bool")
+        integer = rows["INTEGER_KNOB"]
+        self.assertEqual((integer["Min"], integer["Max"], integer["Default"]), (0, 0xFFFFFFFF, "100"))
+        self.assertEqual(rows["FLOAT_KNOB"]["Valid"], "any number")
+
+    def test_describe_collapses_array_elements(self):
+        rows = self.describe_by_field(self.schema)
+        data = rows["COMPLEX_KNOB1a.data[0..4]"]
+        self.assertEqual(data["Default"], "by index: 1, 2, 3, 4, 5")
+        self.assertEqual((data["Min"], data["Max"]), (0, 255))
+        self.assertNotIn("COMPLEX_KNOB1a.data[2]", rows)
+        self.assertIn("COMPLEX_KNOB2.children[0..1].data[0..4]", rows)
+        self.assertIn("COMPLEX_KNOB2.children[0..1].mode", rows)
+        self.assertNotIn("COMPLEX_KNOB1a", rows)
+
+    def test_describe_limits_from_the_schema(self):
+        rows = self.describe_by_field(Schema.parse(self.RANGE_SCHEMA))
+        tdp = rows["TDP"]
+        self.assertEqual(tdp["Valid"], "100 .. 150, decimal or 0x hex")
+        self.assertEqual((tdp["Min"], tdp["Max"], tdp["Help"]), (100, 150, "TDP help"))
+        self.assertEqual((rows["S.level"]["Min"], rows["S.level"]["Max"]), (100, 150))
+        self.assertEqual(rows["S.level"]["Help"], "Level help")
+        self.assertEqual(rows["RATIO"]["Valid"], "0.5 .. 2.5")
+        self.assertEqual((rows["RATIO"]["Min"], rows["RATIO"]["Max"]), (0.5, 2.5))
+        self.assertEqual(rows["S.vals[0..2]"]["Default"], "1")
+        self.assertEqual(rows["S.vals[0..2]"]["Valid"], "0 .. 65535, decimal or 0x hex")
+        # a pretty name is only shown when it differs from the name
+        self.assertEqual(rows["S.mode"]["Valid"].split(" (name")[0], "A=0 (Mode A); B=5")
+
+    def test_describe_knobs_only(self):
+        rows = self.describe_by_field(Schema.parse(self.RANGE_SCHEMA), knobs_only=True)
+        self.assertEqual(list(rows), ["TDP", "RATIO", "SWITCH", "S"])
+        self.assertEqual(rows["S"]["Kind"], "struct")
+        self.assertEqual(rows["S"]["Help"], "Struct help")
+        self.assertTrue(rows["S"]["Valid"].startswith("{level,mode,vals}"))
+        self.assertNotIn("Min", rows["S"])
+
+    def test_describe_array_knob_as_a_whole(self):
+        rows = self.describe_by_field(self.schema, knobs_only=True, filters=["COMPLEX_KNOB2"])
+        self.assertEqual(rows["COMPLEX_KNOB2"]["Type"], "sample_t")
+        self.assertIn("{counter,children}", rows["COMPLEX_KNOB2"]["Valid"])
+
+    def test_describe_filters(self):
+        def fields(*patterns):
+            return [r["Field"] for r in mcv.describe_rows(self.schema, filters=list(patterns))]
+
+        # one element of an array selects the described array
+        self.assertEqual(fields("COMPLEX_KNOB1a.data[2]"), ["COMPLEX_KNOB1a.data[0..4]"])
+        self.assertEqual(fields("COMPLEX_KNOB1a.data[*]"), ["COMPLEX_KNOB1a.data[0..4]"])
+        self.assertEqual(fields("complex_knob1a.mode"), ["COMPLEX_KNOB1a.mode"])
+        self.assertEqual(fields(f"{NS2}:INTEGER*"), ["INTEGER_KNOB2"])
+        self.assertEqual(fields("NO_MATCH"), [])
+
+    def test_describe_same_name_in_two_namespaces_stays_separate(self):
+        rows = [r for r in mcv.describe_rows(self.schema, filters=["COMPLEX_KNOB1b.mode"])]
+        self.assertEqual({r["Namespace"] for r in rows}, {NS1, NS2})
+
+    def test_describe_formats(self):
+        rows = mcv.describe_rows(self.schema, filters=["COMPLEX_KNOB1a.mode", "INTEGER_KNOB"])
+        text = mcv.format_description(rows, "text")
+        self.assertIn(f"{NS1}:COMPLEX_KNOB1a.mode\n  Type:     OPTION_MODE (enum)\n  Default:  First Mode\n  Valid:    "
+                      'FIRST  = 0  "First Mode"  First mode\n            SECOND = 1  "Second Mode"  Second mode',
+                      text)
+        self.assertIn("  Valid:    0 .. 4294967295, decimal or 0x hex", text)
+        self.assertIn("Help:     Integer type", text)
+
+        csv_rows = list(csv.DictReader(io.StringIO(mcv.format_description(rows, "csv"))))
+        self.assertEqual([r["Field"] for r in csv_rows], ["COMPLEX_KNOB1a.mode", "INTEGER_KNOB"])
+        self.assertEqual(list(csv_rows[0]), mcv.DESCRIBE_COLUMNS)
+        self.assertIn("FIRST=0 (First Mode)", csv_rows[0]["Valid"])
+
+        loaded = json.loads(mcv.format_description(rows, "json"))
+        self.assertEqual(loaded[0]["Values"][2]["name"], "THIRD")
+        self.assertEqual(loaded[1]["Max"], 0xFFFFFFFF)
+
+    def test_describe_cli(self):
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(mcv.main(["describe", "-x", sample_path(), "-f", "COMPLEX_KNOB1a.mode"]), 0)
+        self.assertEqual(len(printed.call_args_list), 1)
+        self.assertIn("THIRD  = 2", printed.call_args.args[0])
+
+        out = self.path("describe.json")
+        self.assertEqual(mcv.main(["describe", "-x", sample_path(), "-o", out, "--format", "json",
+                                   "-f", "BOOLEAN_KNOB"]), 0)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)[0]["Valid"], "true or false")
+
+        with mock.patch("builtins.print") as printed:
+            self.assertEqual(mcv.main(["describe", "-x", sample_path(), "-f", "NO_MATCH"]), 0)
+        printed.assert_not_called()
+
+        # No source is involved
+        for other in (["-i", sample_path()], ["--from-system"], ["--current"]):
+            with self.assertRaises(SystemExit):
+                mcv.main(["describe", "-x", sample_path()] + other)
+
+    def test_set_a_whole_struct_or_array(self):
+        result = mcv.modify_variables(self.schema, ["COMPLEX_KNOB1a={{9,8,7,6,5},THIRD}"], drop_unrelated=True)
+        self.assertEqual(self.decode(result[0]), {"data": [9, 8, 7, 6, 5], "mode": 2})
+        result = mcv.modify_variables(self.schema, ["COMPLEX_KNOB1a.data={7}"], drop_unrelated=True)
+        self.assertEqual(self.decode(result[0])["data"], [7, 7, 7, 7, 7])
+
+    def test_enum_values_are_case_insensitive(self):
+        result = mcv.modify_variables(
+            self.schema, ["COMPLEX_KNOB1a.mode=second", "COMPLEX_KNOB1a.data[0]=7"], drop_unrelated=True)
+        self.assertEqual(self.decode(result[0])["mode"], 1)
+        for text in ("SECOND", "Second", "sEcOnD", "second mode", "SECOND MODE", "Second Mode", "1"):
+            result = mcv.modify_variables(self.schema, [f"COMPLEX_KNOB1a.mode={text}"], drop_unrelated=True)
+            self.assertEqual(self.decode(result[0])["mode"], 1, text)
+
+        # also inside the value of a whole struct
+        result = mcv.modify_variables(self.schema, ["COMPLEX_KNOB1a={{1,2,3,4,5},third}"], drop_unrelated=True)
+        self.assertEqual(self.decode(result[0])["mode"], 2)
+
+        # a wrong name is still an error
+        with self.assertRaises(mcv.ModifyError):
+            mcv.modify_variables(self.schema, ["COMPLEX_KNOB1a.mode=seconds"])
+
+    def test_enum_case_insensitive_match_must_not_be_ambiguous(self):
+        schema = Schema.parse("""<ConfigSchema>
+  <Enums>
+    <Enum name="CASE_T">
+      <Value name="Low" value="0" />
+      <Value name="LOW" value="1" />
+      <Value name="High" value="2" />
+    </Enum>
+  </Enums>
+  <Knobs namespace="{11111111-2222-3333-4444-555555555555}">
+    <Knob name="K" type="CASE_T" />
+  </Knobs>
+</ConfigSchema>""")
+        mcv.accept_any_case_for_enums(schema)
+        mcv.accept_any_case_for_enums(schema)    # applying it again must not wrap it twice
+        fmt = schema.get_knob("11111111-2222-3333-4444-555555555555", "K").format
+        # An exact match always wins
+        self.assertEqual((fmt.string_to_object("Low"), fmt.string_to_object("LOW")), (0, 1))
+        self.assertEqual(fmt.string_to_object("high"), 2)
+        self.assertEqual(fmt.string_to_object(""), 0)
+        self.assertEqual(fmt.string_to_object("2"), 2)
+        with self.assertRaises(ParseError):
+            fmt.string_to_object("low")
+        with self.assertRaises(ParseError):
+            fmt.string_to_object("nothing")
+
+    def test_enum_case_change_does_not_touch_the_shared_parser(self):
+        # Only the schemas handled by this tool get the new behavior, the shared VariableList code does not
+        other = Schema.load(sample_path())
+        mcv.accept_any_case_for_enums(self.schema)
+        mode = other.get_knob(NS1, "COMPLEX_KNOB1a.mode").format
+        with self.assertRaises(ParseError):
+            mode.string_to_object("second")
+        self.assertEqual(mode.string_to_object("SECOND"), 1)
+        self.assertEqual(self.schema.get_knob(NS1, "COMPLEX_KNOB1a.mode").format.string_to_object("second"), 1)
+
+    def test_bool_values_are_case_insensitive(self):
+        for text in ("true", "True", "TRUE", "tRuE", " true ", "1", "yes", "YES"):
+            result = mcv.modify_variables(self.schema, [f"BOOLEAN_KNOB2={text}"], drop_unrelated=True)
+            self.assertIs(self.decode(result[0]), True, text)
+        for text in ("false", "False", "FALSE", "0"):
+            result = mcv.modify_variables(self.schema, [f"BOOLEAN_KNOB={text}"], drop_unrelated=True)
+            self.assertIs(self.decode(result[0]), False, text)
+
+        # booleans inside a struct and an array of booleans
+        schema = Schema.parse("""<ConfigSchema>
+  <Structs>
+    <Struct name="s_t">
+      <Member name="on" type="bool" default="false" />
+      <Member name="flags" type="bool" count="2" default="{false}" />
+    </Struct>
+  </Structs>
+  <Knobs namespace="{11111111-2222-3333-4444-555555555555}">
+    <Knob name="S" type="s_t" />
+    <Knob name="DEF" type="bool" default="TRUE" />
+  </Knobs>
+</ConfigSchema>""")
+        self.assertIs(schema.get_knob("11111111-2222-3333-4444-555555555555", "DEF").knob.default, True)
+        for change, expected in (("S.on=TRUE", {"on": True, "flags": [False, False]}),
+                                 ("S.flags[1]=True", {"on": False, "flags": [False, True]}),
+                                 ("S={TRUE,{True,false}}", {"on": True, "flags": [True, False]})):
+            knob = schema.get_knob("11111111-2222-3333-4444-555555555555", "S").knob
+            result = mcv.modify_variables(schema, [change], drop_unrelated=True)
+            self.assertEqual(knob.format.binary_to_object(result[0].data), expected, change)
+
+    def test_modify_errors_tell_the_valid_values(self):
+        def error_of(change):
+            with self.assertRaises(mcv.ModifyError) as context:
+                mcv.modify_variables(self.schema, [change])
+            return str(context.exception)
+
+        self.assertIn("Valid values: FIRST=0 (First Mode); SECOND=1 (Second Mode); THIRD=2 (Third Mode)",
+                      error_of("COMPLEX_KNOB1a.mode=BAD"))
+        self.assertIn("Valid values: 0 .. 255", error_of("COMPLEX_KNOB1a.data[2]=300"))
+        self.assertIn("Valid values: 0 .. 255", error_of("COMPLEX_KNOB1a.data[2]=abc"))
+        self.assertIn("with 5 elements", error_of("COMPLEX_KNOB1a.data={1,2}"))
+        self.assertIn("Valid values: {counter,children}", error_of("COMPLEX_KNOB2={1}"))
 
 
 class ToolIntegrationTests(QuietTestCase):

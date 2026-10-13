@@ -233,7 +233,8 @@ line of `*`s.
 ## Command Line: Crafting and Dumping a .vl File
 
 [ModifyConfVarList.py](../../Tools/ModifyConfVarList.py) works with .vl data from a config XML without the UI. It has
-two subcommands: `modify` creates or updates a .vl file, and `dump` prints the fields of the schema with their values.
+three subcommands: `modify` creates or updates a .vl file, `dump` prints the fields of the schema with their values,
+and `describe` tells which values each field accepts.
 
 A field is a knob (`INTEGER_KNOB`), a struct member (`KNOB.member`), or an array element (`KNOB.member[2]`,
 `KNOB.children[1].data[0]`).
@@ -241,8 +242,10 @@ A field is a knob (`INTEGER_KNOB`), a struct member (`KNOB.member`), or an array
 ### modify
 
 Changes specific fields. Values use the same syntax as the defaults in the XML (numbers, enum names, `true`/`false`,
-`{...}` for structs and arrays). If a knob name exists in more than one namespace, prefix the field with the namespace
-GUID (`GUID:KNOB.member=VALUE`).
+`{...}` for structs and arrays). Enum names and pretty names, and `true`/`false`, are not case sensitive: `second`,
+`SECOND` and `Second Mode` select the same enum value, and `true`, `True` and `TRUE` are all true. A name that only
+differs by case from another value of the same enum is ambiguous and is rejected unless it matches exactly. If a knob
+name exists in more than one namespace, prefix the field with the namespace GUID (`GUID:KNOB.member=VALUE`).
 
 ```text
 # Default .vl built from the schema alone
@@ -295,3 +298,43 @@ python ModifyConfVarList.py dump -x sampleschema.xml --from-system -f "COMPLEX_K
 
 - `-f/--filter` can be repeated and is case insensitive. It matches the field name or `NAMESPACE_GUID:FIELD`.
 - `--format` is `text` (default), `csv` or `json`.
+
+### describe
+
+Tells which values a field accepts. It only needs the schema (no `.vl`, no system access), so use it before `modify`
+to know what can be written:
+
+- an enum: every value with its name, pretty name, number and help. `modify` accepts the name or the pretty name (in any
+  letter case), or the number;
+- a bool: `true` or `false` in any letter case;
+- an integer or a float: the accepted range, from the `min`/`max` of the knob or member, else from the C type;
+- a struct or an array (with `--knobs`): the syntax, such as `{member1,member2}` or `{v}` to set every element.
+
+The type, the default and the `help` of the schema are printed too. The elements of an array are described once, with
+the indexes in the name, for example `COMPLEX_KNOB1a.data[0..4]`.
+
+```text
+# Every field of the schema
+python ModifyConfVarList.py describe -x sampleschema.xml
+
+# One field, an element of an array selects the whole array
+python ModifyConfVarList.py describe -x sampleschema.xml -f COMPLEX_KNOB1a.mode
+
+# One entry per knob, as JSON (the enums also come with the list of their values)
+python ModifyConfVarList.py describe -x sampleschema.xml --knobs --format json -o schema_info.json
+```
+
+Example output:
+
+```text
+FE3ED49F-B173-41ED-9076-356661D46A42:COMPLEX_KNOB1a.mode
+  Type:     OPTION_MODE (enum)
+  Default:  First Mode
+  Valid:    FIRST  = 0  "First Mode"  First mode
+            SECOND = 1  "Second Mode"  Second mode
+            THIRD  = 2  "Third Mode"  Third mode
+            (name or pretty name in any letter case, or the number, can be used)
+```
+
+`-f/--filter`, `--knobs`, `--format` and `-o` work as in `dump`. When a `modify` change is rejected, the error message
+also lists the valid values of the field.

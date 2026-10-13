@@ -9,6 +9,7 @@
 
 import io
 import os
+import re
 import sys
 import csv
 import json
@@ -26,6 +27,13 @@ from VariableList import (
     UEFIVariable,
     ParseError,
     InvalidRangeError,
+    EnumFormat,
+    StringEvaluationContext,
+    BoolFormat,
+    IntValueFormat,
+    FloatValueFormat,
+    StructFormat,
+    ArrayFormat,
     create_vlist_buffer,
     read_vlist,
 )
@@ -72,11 +80,12 @@ def parse_assignment(text):
 
 def find_subknob(schema, guid, path):
     """Find the one field (SubKnob) in the schema matching the path and the optional namespace."""
-    matches = [
-        subknob
-        for subknob in schema.subknobs
-        if subknob.name == path and (guid is None or uuid.UUID(subknob.knob.namespace) == guid)
-    ]
+    # The schema lists the field of a struct knob twice, only one per namespace is wanted
+    found = OrderedDict()
+    for subknob in schema.subknobs:
+        if subknob.name == path and (guid is None or uuid.UUID(subknob.knob.namespace) == guid):
+            found.setdefault(uuid.UUID(subknob.knob.namespace), subknob)
+    matches = list(found.values())
 
     if not matches:
         raise ModifyError(f"Field '{path}' is not defined in the schema" + (f" (namespace {guid})" if guid else ""))
@@ -178,6 +187,158 @@ def format_rows(rows, output_format):
 
 
 #
+# Describe: tell which values a field of the schema accepts
+#
+DESCRIBE_COLUMNS = ["Namespace", "Field", "Type", "Kind", "Default", "Valid", "Help"]
+ARRAY_INDEX = re.compile(r"\[(\d+)\]")
+VARIES = "differs by index, describe the fields one by one"
+
+
+def field_kind(fmt):
+    if isinstance(fmt, EnumFormat):
+        return "enum"
+    if isinstance(fmt, BoolFormat):
+        return "bool"
+    if isinstance(fmt, IntValueFormat):
+        return "integer"
+    if isinstance(fmt, FloatValueFormat):
+        return "float"
+    if isinstance(fmt, StructFormat):
+        return "struct"
+    return "array"
+
+
+def field_type_name(fmt):
+    if isinstance(fmt, ArrayFormat):
+        return f"{fmt.c_type}[{fmt.count}]"
+    return fmt.c_type
+
+
+def enum_values(fmt):
+    return [
+        OrderedDict([("name", v.name), ("pretty_name", v.pretty_name), ("value", v.number), ("help", v.help)])
+        for v in fmt.values
+    ]
+
+
+def valid_text(fmt, min_value=None, max_value=None):
+    """One line telling which values a field accepts."""
+    if isinstance(fmt, EnumFormat):
+        return "; ".join(
+            f"{v.name}={v.number}" + (f" ({v.pretty_name})" if v.pretty_name != v.name else "") for v in fmt.values
+        ) + " (name or pretty name in any letter case, or the number)"
+    if isinstance(fmt, BoolFormat):
+        return "true or false"
+    if isinstance(fmt, (IntValueFormat, FloatValueFormat)):
+        if min_value is None and max_value is None:
+            return "any number"
+        low = "-inf" if min_value is None else min_value
+        high = "inf" if max_value is None else max_value
+        return f"{low} .. {high}" + (", decimal or 0x hex" if isinstance(fmt, IntValueFormat) else "")
+    if isinstance(fmt, StructFormat):
+        return "{" + ",".join(member.name for member in fmt.members) + "}, one value for each member"
+    return f"{{v0,...,v{fmt.count - 1}}} with {fmt.count} elements, or {{v}} to set all the elements to v"
+
+
+def valid_text_for_field(subknob):
+    """valid_text() for a field of the schema, with the limits of the knob."""
+    if isinstance(subknob.format, (IntValueFormat, FloatValueFormat)):
+        return valid_text(subknob.format, subknob.min, subknob.max)
+    return valid_text(subknob.format)
+
+
+def describe_rows(schema, knobs_only=False, filters=None):
+    """Build the rows describing what the fields of the schema accept.
+
+    The array elements of the same field are described once, with the range of the indexes in the name,
+    for example COMPLEX_KNOB1a.data[0..4].
+
+    Args:
+        schema: Loaded Schema.
+        knobs_only: One row per knob instead of one row per field.
+        filters: Wildcard patterns, a row is kept when its field matches one of them.
+    """
+    groups = OrderedDict()
+    for knob in schema.knobs:
+        for subknob in (knob.subknobs[:1] if knobs_only else [s for s in knob.subknobs if s.leaf]):
+            groups.setdefault((knob.namespace, ARRAY_INDEX.sub("[*]", subknob.name)), []).append(subknob)
+
+    rows = []
+    for (namespace, wildcard_name), subknobs in groups.items():
+        first = subknobs[0]
+        indexes = [[int(i) for i in ARRAY_INDEX.findall(s.name)] for s in subknobs]
+        highest = iter([max(position) for position in zip(*indexes)] if indexes[0] else [])
+
+        def index_range(_):
+            last = next(highest)
+            return f"[0..{last}]" if last else "[0]"
+
+        display_name = ARRAY_INDEX.sub(index_range, first.name)
+
+        if not any(matches_filters(namespace, name, filters)
+                   for name in [wildcard_name, display_name] + [s.name for s in subknobs]):
+            continue
+
+        fmt = first.format
+        defaults = [fmt.object_to_string(s.default) for s in subknobs]
+        if len(set(defaults)) == 1:
+            default_text = defaults[0]
+        else:
+            default_text = "by index: " + ", ".join(defaults[:8]) + (", ..." if len(defaults) > 8 else "")
+        limits = {(str(s.min), str(s.max)) for s in subknobs} if isinstance(fmt, (IntValueFormat, FloatValueFormat)) \
+            else set()
+        row = OrderedDict(zip(DESCRIBE_COLUMNS, [
+            str(namespace).upper(),
+            display_name,
+            field_type_name(fmt),
+            field_kind(fmt),
+            default_text,
+            VARIES if len(limits) > 1 else valid_text_for_field(first),
+            first.knob.help if knobs_only else first.help,
+        ]))
+        if isinstance(fmt, EnumFormat):
+            row["Values"] = enum_values(fmt)
+        elif len(limits) == 1:
+            row["Min"] = first.min
+            row["Max"] = first.max
+        rows.append(row)
+
+    return rows
+
+
+def format_description(rows, output_format):
+    if output_format == "json":
+        return json.dumps(rows, indent=2)
+
+    if output_format == "csv":
+        buffer = io.StringIO()
+        writer = csv.DictWriter(buffer, fieldnames=DESCRIBE_COLUMNS, extrasaction="ignore", lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+        return buffer.getvalue().rstrip("\n")
+
+    blocks = []
+    for row in rows:
+        type_text = row["Type"] if row["Type"] == row["Kind"] else f"{row['Type']} ({row['Kind']})"
+        lines = [f"{row['Namespace']}:{row['Field']}",
+                 f"  Type:     {type_text}",
+                 f"  Default:  {row['Default']}"]
+        if row["Help"]:
+            lines.append(f"  Help:     {row['Help']}")
+        if "Values" in row:
+            width = max(len(v["name"]) for v in row["Values"])
+            for index, value in enumerate(row["Values"]):
+                pretty = f'"{value["pretty_name"]}"' if value["pretty_name"] != value["name"] else ""
+                text = f"{value['name'].ljust(width)} = {value['value']}  {pretty}  {value['help']}".rstrip()
+                lines.append(("  Valid:    " if index == 0 else "            ") + text)
+            lines.append("            (name or pretty name in any letter case, or the number, can be used)")
+        else:
+            lines.append(f"  Valid:    {row['Valid']}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+#
 # Core: apply the changes and build the list of variables to write
 #
 def load_knob_value(knob, variable):
@@ -195,6 +356,38 @@ def load_knob_value(knob, variable):
     knob.value = knob.format.binary_to_object(variable.data)
 
 
+def accept_any_case_for_enums(schema):
+    """Let the enums of this schema accept a name or a pretty name in any letter case.
+
+    The enum formats of the schema are shared by the knobs and the struct members, so wrapping the parsing of
+    these instances covers every place an enum value can be typed. The shared parser in VariableList.py is not
+    changed: an exact match is always tried first, and the case is only ignored when it is not ambiguous.
+    """
+    for enum in schema.enums:
+        if getattr(enum, "accepts_any_case", False):
+            continue
+
+        def parse(text, eval_context=StringEvaluationContext.DEFAULT, enum=enum, exact=enum.string_to_object):
+            try:
+                return exact(text, eval_context)
+            except ParseError:
+                wanted = text.strip().casefold()
+                numbers = {
+                    value.number for value in enum.values
+                    if wanted in (value.name.casefold(), value.pretty_name.casefold())
+                }
+                if len(numbers) == 1:
+                    return numbers.pop()
+                if len(numbers) > 1:
+                    raise ParseError(
+                        f"Value '{text}' is ambiguous in enum '{enum.name}', "
+                        "it matches more than one value when the case is ignored")
+                raise
+
+        enum.string_to_object = parse
+        enum.accepts_any_case = True
+
+
 def modify_variables(schema, changes, variables=None, drop_unrelated=False):
     """Apply the changes to the schema knobs and return the resulting list of UEFIVariable.
 
@@ -204,6 +397,7 @@ def modify_variables(schema, changes, variables=None, drop_unrelated=False):
         variables: Variables of an input .vl (list of UEFIVariable) or None to start from the schema defaults.
         drop_unrelated: Only return the variables that are modified by changes.
     """
+    accept_any_case_for_enums(schema)
     resolved = []
     touched = OrderedDict()
     for change in changes:
@@ -225,7 +419,8 @@ def modify_variables(schema, changes, variables=None, drop_unrelated=False):
             subknob.value = subknob.format.string_to_object(value)
             new = subknob.format.object_to_string(subknob.value)
         except (ParseError, InvalidRangeError, ValueError, TypeError, KeyError, IndexError) as e:
-            raise ModifyError(f"Cannot set {subknob.name} to '{value}': {e}")
+            raise ModifyError(
+                f"Cannot set {subknob.name} to '{value}': {e}. Valid values: {valid_text_for_field(subknob)}")
         logging.info(f"{subknob.knob.namespace}:{subknob.name}: {old} -> {new}")
 
     def build(knob, original=None):
@@ -395,10 +590,13 @@ Examples:
     ModifyConfVarList.py dump -x schema.xml --from-system --filter "COMPLEX_KNOB1a*" --format csv
   Print the current configuration: system values, schema defaults where the system has none:
     ModifyConfVarList.py dump -x schema.xml --current
+  Tell which values a field accepts (enum values, true/false, number range):
+    ModifyConfVarList.py describe -x schema.xml
+    ModifyConfVarList.py describe -x schema.xml -f "COMPLEX_KNOB1a.mode"
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{modify,dump}")
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="{modify,dump,describe}")
 
     modify = subparsers.add_parser(
         "modify", help="Create or update a .vl file by changing fields of the schema",
@@ -441,11 +639,29 @@ Examples:
                       help="Only print the fields matching this case-insensitive wildcard pattern, can be repeated. "
                            "It matches the field (KNOB.member[2]) or NAMESPACE_GUID:FIELD")
 
+    describe = subparsers.add_parser(
+        "describe", help="Tell which values the fields of the schema accept",
+        description="Print, for the fields of the schema, the type, the default, the help and which values are "
+                    "accepted: the list of values of an enum, true/false, or the range of a number. Only the schema "
+                    "is needed. The array elements of a field are described once, such as KNOB.data[0..4].")
+    describe.add_argument("-x", "--xml", dest="schema_file", required=True, type=str, help="Config schema XML file")
+    describe.add_argument("-f", "--filter", dest="filters", action="append", default=[], metavar="PATTERN",
+                          help="Only describe the fields matching this case-insensitive wildcard pattern, can be "
+                               "repeated. It matches the field (KNOB.member[2], KNOB.member[*]) or "
+                               "NAMESPACE_GUID:FIELD")
+    describe.add_argument("--knobs", dest="knobs_only", action="store_true",
+                          help="One entry per knob (the whole struct) instead of one entry per field")
+    describe.add_argument("--format", dest="output_format", choices=["text", "csv", "json"], default="text",
+                          help="Output format (default: text). json also has the list of values of the enums")
+    describe.add_argument("-o", "--output", dest="output_file", type=str,
+                          help="Optional, write the result to this file. Without it the result is printed to stdout")
+    describe.add_argument("-v", "--verbose", action="store_true", help="Print more details")
+
     arguments = parser.parse_args(argv)
 
     if not os.path.isfile(arguments.schema_file):
         parser.error(f"Invalid schema file: {arguments.schema_file}")
-    if arguments.input_file is not None and not os.path.isfile(arguments.input_file):
+    if getattr(arguments, "input_file", None) is not None and not os.path.isfile(arguments.input_file):
         parser.error(f"Invalid input file: {arguments.input_file}")
     if arguments.command == "modify" and arguments.drop_unrelated and not arguments.changes:
         parser.error("--drop-unrelated needs at least one -s/--set change")
@@ -486,16 +702,27 @@ def run_modify(arguments, schema):
         apply_to_system(arguments, arguments.schema_file, arguments.output_file)
 
 
-def run_dump(arguments, schema):
-    rows = dump_rows(schema, load_source_variables(arguments), arguments.knobs_only,
-                     arguments.changed_only, arguments.filters)
-    text = format_rows(rows, arguments.output_format)
+def write_or_print(arguments, rows, text):
     if arguments.output_file:
         with open(arguments.output_file, "w", encoding="utf-8", newline="") as file:
             file.write(text + "\n")
         print(f"{len(rows)} row(s) written to {arguments.output_file}")
     else:
         print(text)
+
+
+def run_dump(arguments, schema):
+    rows = dump_rows(schema, load_source_variables(arguments), arguments.knobs_only,
+                     arguments.changed_only, arguments.filters)
+    write_or_print(arguments, rows, format_rows(rows, arguments.output_format))
+
+
+def run_describe(arguments, schema):
+    rows = describe_rows(schema, arguments.knobs_only, arguments.filters)
+    if not rows and arguments.output_format == "text":
+        logging.warning("No field of the schema matches")
+        return
+    write_or_print(arguments, rows, format_description(rows, arguments.output_format))
 
 
 def main(argv=None):
@@ -506,6 +733,8 @@ def main(argv=None):
         schema = Schema.load(arguments.schema_file)
         if arguments.command == "modify":
             run_modify(arguments, schema)
+        elif arguments.command == "describe":
+            run_describe(arguments, schema)
         else:
             run_dump(arguments, schema)
     except ModifyError as e:
