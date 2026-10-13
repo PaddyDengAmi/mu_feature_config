@@ -17,3 +17,4 @@ edk2-pytool-extensions==0.31.2
 xmlschema==4.3.2
 regex==2026.9.10
 pywin32==312; sys_platform == 'win32'
+pyinstaller==6.22.3
